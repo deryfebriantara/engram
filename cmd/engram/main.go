@@ -77,7 +77,7 @@ func newService(ctx context.Context) (*memory.Service, *embedder.OllamaEmbedder,
 func runRecall(args []string) {
 	fs := flag.NewFlagSet("recall", flag.ExitOnError)
 	limit := fs.Int("limit", 3, "max results to print (max 10)")
-	threshold := fs.Float64("threshold", 0.55, "max raw distance to consider")
+	threshold := fs.Float64("threshold", 0.48, "max raw distance to consider")
 	source := fs.String("source", "", "source to boost when it matches a memory's source")
 	fs.Parse(args)
 

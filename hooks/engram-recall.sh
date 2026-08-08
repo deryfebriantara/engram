@@ -41,10 +41,20 @@ SOURCE="$(basename "${CWD:-.}" 2>/dev/null)"
 
 OUTPUT="$(timeout 10 "$ENGRAM_BIN" recall \
   -limit "${ENGRAM_RECALL_LIMIT:-3}" \
-  -threshold "${ENGRAM_RECALL_THRESHOLD:-0.55}" \
+  -threshold "${ENGRAM_RECALL_THRESHOLD:-0.48}" \
   -source "$SOURCE" \
   -- "$PROMPT" 2>/dev/null)"
 RC=$?
+
+# One line per prompt (fired or silent) so the hook's real-world hit rate
+# can be audited later; never blocks the hook itself.
+LOG_FILE="$HOME/.claude/logs/engram-recall.log"
+log() {
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >>"$LOG_FILE" 2>/dev/null
+}
+HITS="$(printf '%s' "$OUTPUT" | grep -c '^- ' 2>/dev/null)"
+log "cwd=$SOURCE hits=${HITS:-0} rc=$RC prompt=${PROMPT:0:60}"
 
 [ $RC -eq 0 ] || exit 0
 [ -n "$OUTPUT" ] || exit 0

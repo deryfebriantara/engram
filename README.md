@@ -241,7 +241,7 @@ stdout is kept machine-clean on every subcommand — diagnostics always go to st
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENGRAM_RECALL_LIMIT` | `3` | Max memories the recall hook injects per prompt |
-| `ENGRAM_RECALL_THRESHOLD` | `0.55` | Max raw cosine distance the recall hook will consider (measured on nomic-embed-text: related prompts land at ~0.37–0.48, unrelated at ~0.6+) |
+| `ENGRAM_RECALL_THRESHOLD` | `0.48` | Max raw cosine distance the recall hook will consider. Benchmarked on nomic-embed-text with a 12-memory store and 18 mixed EN/ID prompts: 0.48 gave 10/10 relevant hits with 2/8 false positives; 0.55 kept 10/10 but false-positived on 7/8 unrelated prompts |
 | `DEDUP_THRESHOLD` | `0.2` | Max cosine distance for `Service.Store` to treat a new memory as a duplicate and merge instead of insert (see [Design Decisions](#design-decisions)); `0` disables dedup |
 
 ---
