@@ -9,14 +9,15 @@ import (
 )
 
 type Service struct {
-	store Store
+	store          Store
+	dedupThreshold float64
 }
 
-func NewService(store Store) *Service {
-	return &Service{store: store}
+func NewService(store Store, dedupThreshold float64) *Service {
+	return &Service{store: store, dedupThreshold: dedupThreshold}
 }
 
-func (s *Service) Store(ctx context.Context, req StoreRequest) (*Memory, error) {
+func (s *Service) Store(ctx context.Context, req StoreRequest) (*StoreOutcome, error) {
 	if req.Content == "" {
 		return nil, fmt.Errorf("content is required")
 	}
@@ -29,6 +30,31 @@ func (s *Service) Store(ctx context.Context, req StoreRequest) (*Memory, error) 
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+
+	if s.dedupThreshold > 0 {
+		// Best-effort: the new memory doesn't exist yet, so there's no
+		// self-match risk. If the dedup lookup fails, fall through to a
+		// normal insert rather than blocking the store on it.
+		if results, err := s.store.Search(ctx, req.Content, "", nil, 1); err == nil && len(results) > 0 {
+			top := results[0]
+			if float64(top.Distance) <= s.dedupThreshold {
+				mem := top.Memory
+				mem.Content = req.Content
+				mem.Category = req.Category
+				mem.Tags = unionTags(mem.Tags, req.Tags)
+				if req.Source != "" {
+					mem.Source = req.Source
+				}
+				mem.UpdatedAt = now
+
+				if err := s.store.Update(ctx, mem); err != nil {
+					return nil, fmt.Errorf("update memory: %w", err)
+				}
+				return &StoreOutcome{Memory: &mem, SupersededID: mem.ID}, nil
+			}
+		}
+	}
+
 	mem := Memory{
 		ID:        uuid.New().String(),
 		Content:   req.Content,
@@ -45,7 +71,27 @@ func (s *Service) Store(ctx context.Context, req StoreRequest) (*Memory, error) 
 	if err := s.store.Add(ctx, mem); err != nil {
 		return nil, fmt.Errorf("store memory: %w", err)
 	}
-	return &mem, nil
+	return &StoreOutcome{Memory: &mem}, nil
+}
+
+// unionTags merges b into a, preserving a's order, then appending any of b's
+// tags not already present, with no duplicates.
+func unionTags(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	result := make([]string, 0, len(a)+len(b))
+	for _, t := range a {
+		if !seen[t] {
+			seen[t] = true
+			result = append(result, t)
+		}
+	}
+	for _, t := range b {
+		if !seen[t] {
+			seen[t] = true
+			result = append(result, t)
+		}
+	}
+	return result
 }
 
 func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {

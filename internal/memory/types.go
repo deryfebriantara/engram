@@ -47,6 +47,14 @@ type SearchResult struct {
 	Distance float32 `json:"distance"`
 }
 
+// StoreOutcome describes what Service.Store actually did: SupersededID is
+// empty for a fresh insert, or set to the id of the pre-existing memory that
+// was merged into when a near-duplicate was found.
+type StoreOutcome struct {
+	Memory       *Memory
+	SupersededID string
+}
+
 type ListRequest struct {
 	Category string   `json:"category"`
 	Tags     []string `json:"tags"`

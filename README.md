@@ -197,6 +197,55 @@ You should see ChromaDB and Ollama both reporting `ok`.
 
 ---
 
+## Automatic memory (Claude Code hooks)
+
+Beyond the MCP tools (which Claude calls deliberately), Engram ships two Claude Code hooks that make memory recall and capture *automatic*, via the `engram` CLI (`cmd/engram`) — a stdio-driven front-end to the same memory service, built for scripting rather than conversation.
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `hooks/engram-recall.sh` | `UserPromptSubmit` | Searches memory for the incoming prompt and, if relevant memories clear the distance threshold, injects them as context before Claude sees the prompt. Skips silently on short prompts (<20 chars), slash commands, or any internal error. |
+| `hooks/engram-capture.sh` | `SessionEnd` | Sends the session transcript to the self-hosted Qwen gateway, asks it to extract 0–5 durable memories (preferences, decisions, patterns, facts — never task minutiae or secrets), and stores whatever qualifies. Logs every decision to `~/.claude/logs/engram-capture.log`; produces no stdout. |
+
+Both scripts are defensive by design: they depend only on `jq`/`curl`/coreutils, bound every network call with `timeout`, and always exit `0` so a broken hook can never block Claude Code.
+
+Install them with:
+
+```bash
+make install-hooks
+```
+
+This copies the scripts to `~/.claude/hooks/` — it does **not** register them. Wire them up yourself in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/engram-recall.sh" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/engram-capture.sh" }] }]
+  }
+}
+```
+
+### `engram` CLI
+
+| Command | Description |
+|---------|-------------|
+| `engram recall [-limit N] [-threshold F] [-source S] <query...>` | Semantic search, re-ranked by recency and source match; prints one `- [category] content (tags: ...; source: ...; age)` line per hit, nothing if none clear the threshold |
+| `engram store [-category C] [-tags a,b] [-source S] <content...>` | Stores a memory (dedup applies); prints `stored <id>` or `merged into <id>` |
+| `engram delete <id>` | Deletes a memory; prints `deleted <id>` |
+| `engram health` | Reports ChromaDB/Ollama status and memory count; exits non-zero if either is unhealthy |
+
+stdout is kept machine-clean on every subcommand — diagnostics always go to stderr — because `engram recall`'s output is injected straight into an LLM's context by the recall hook.
+
+### Env knobs
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGRAM_RECALL_LIMIT` | `3` | Max memories the recall hook injects per prompt |
+| `ENGRAM_RECALL_THRESHOLD` | `0.55` | Max raw cosine distance the recall hook will consider (measured on nomic-embed-text: related prompts land at ~0.37–0.48, unrelated at ~0.6+) |
+| `DEDUP_THRESHOLD` | `0.2` | Max cosine distance for `Service.Store` to treat a new memory as a duplicate and merge instead of insert (see [Design Decisions](#design-decisions)); `0` disables dedup |
+
+---
+
 ## Configuration
 
 All settings are configurable via environment variables:
@@ -207,6 +256,7 @@ All settings are configurable via environment variables:
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama API URL |
 | `OLLAMA_MODEL` | `nomic-embed-text` | Embedding model (768 dimensions) |
 | `COLLECTION_NAME` | `claude_memories` | ChromaDB collection name |
+| `DEDUP_THRESHOLD` | `0.2` | Cosine-distance threshold for merging near-duplicate memories on store; `0` disables |
 
 To use custom values, set them before running, or configure in your Claude Code MCP settings:
 
@@ -220,15 +270,18 @@ claude mcp add claude-memory -- env CHROMA_URL=http://my-chroma:8000 ~/.local/bi
 
 ```
 engram/
-├── cmd/claude-memory-server/
-│   └── main.go                    # Entry point — wires deps, starts stdio server
+├── cmd/
+│   ├── claude-memory-server/
+│   │   └── main.go                # Entry point — wires deps, starts stdio MCP server
+│   └── engram/
+│       └── main.go                # CLI entry point — recall/store/delete/health subcommands
 ├── internal/
 │   ├── config/config.go           # Environment variable loading
 │   ├── embedder/ollama.go         # Ollama embedding function wrapper
 │   ├── chromastore/store.go       # ChromaDB operations (implements Store interface)
 │   ├── memory/
 │   │   ├── types.go               # Memory struct, Store interface, request/response types
-│   │   └── service.go             # Business logic, validation, orchestration
+│   │   └── service.go             # Business logic, validation, dedup/supersede, orchestration
 │   └── tools/
 │       ├── register.go            # Bulk tool registration
 │       ├── memory_store.go        # memory_store handler
@@ -237,8 +290,11 @@ engram/
 │       ├── memory_delete.go       # memory_delete handler
 │       ├── memory_update.go       # memory_update handler
 │       └── health_check.go        # health_check handler
+├── hooks/
+│   ├── engram-recall.sh           # UserPromptSubmit hook — auto-injects relevant memories
+│   └── engram-capture.sh          # SessionEnd hook — extracts + stores memories via Qwen gateway
 ├── docker-compose.yml             # ChromaDB container
-├── Makefile                       # Build, install, test, infra targets
+├── Makefile                       # Build, install, test, infra, hooks targets
 ├── go.mod
 └── go.sum
 ```
@@ -249,13 +305,14 @@ engram/
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Compile the binary |
-| `make install` | Build + copy to `~/.local/bin` |
+| `make build` | Compile both `claude-memory-server` and `engram` |
+| `make install` | Build + copy both binaries to `~/.local/bin` |
+| `make install-hooks` | Copy `hooks/*.sh` to `~/.claude/hooks/` (does not register them) |
 | `make test` | Run all tests |
 | `make infra` | Start ChromaDB via Docker Compose |
 | `make infra-down` | Stop ChromaDB |
 | `make register` | Show Claude Code registration command |
-| `make clean` | Remove built binary |
+| `make clean` | Remove built binaries |
 
 ---
 
@@ -278,6 +335,7 @@ engram/
 - **Auto-embedding** — chroma-go's built-in Ollama integration means the server passes text, not vectors. Embedding happens transparently on add and query.
 - **Single collection** — All memories live in `claude_memories` with category as a metadata filter, keeping the data model simple.
 - **Interface-driven store** — The `memory.Store` interface decouples business logic from ChromaDB, enabling future database swaps or mock-based testing.
+- **Dedup/supersede on store** — `Service.Store` runs a best-effort nearest-neighbor search before inserting; if the closest existing memory is within `DEDUP_THRESHOLD` cosine distance, it's updated in place (content replaced, tags unioned, source kept unless overridden) instead of creating a near-duplicate. This makes repeated auto-capture of the same fact idempotent rather than noisy. A failed dedup lookup never blocks the store — it just falls back to a normal insert.
 - **Errors via MCP** — Tool handlers return `mcp.NewToolResultError()`, never Go-level errors, so Claude always gets a readable message.
 - **Stderr-only logging** — stdout is reserved exclusively for MCP JSON-RPC; all logs go to stderr.
 
