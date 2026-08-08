@@ -18,7 +18,7 @@ test:
 infra:
 	docker compose up -d
 	@echo "Waiting for ChromaDB..."
-	@until curl -sf http://localhost:8000/api/v1/heartbeat > /dev/null 2>&1; do sleep 1; done
+	@until curl -sf http://localhost:8000/api/v2/heartbeat > /dev/null 2>&1; do sleep 1; done
 	@echo "ChromaDB is ready."
 
 infra-down:
