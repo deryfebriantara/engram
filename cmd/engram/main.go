@@ -37,6 +37,10 @@ func main() {
 		runStore(args)
 	case "delete":
 		runDelete(args)
+	case "list":
+		runList(args)
+	case "stats":
+		runStats(args)
 	case "health":
 		runHealth(args)
 	case "-h", "--help", "help":
@@ -53,6 +57,8 @@ func usage() {
   engram recall [-limit N] [-threshold F] [-source S] <query...>
   engram store [-category C] [-tags a,b] [-source S] <content...>
   engram delete <id>
+  engram list [-category C] [-tags a,b] [-limit N] [-offset N]
+  engram stats
   engram health`)
 }
 
@@ -77,7 +83,7 @@ func newService(ctx context.Context) (*memory.Service, *embedder.OllamaEmbedder,
 func runRecall(args []string) {
 	fs := flag.NewFlagSet("recall", flag.ExitOnError)
 	limit := fs.Int("limit", 3, "max results to print (max 10)")
-	threshold := fs.Float64("threshold", 0.48, "max raw distance to consider")
+	threshold := fs.Float64("threshold", 0.42, "max raw distance to consider")
 	source := fs.String("source", "", "source to boost when it matches a memory's source")
 	fs.Parse(args)
 
@@ -106,6 +112,13 @@ func runRecall(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engram recall: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Best-effort guard: skip the (relatively expensive) embed + search round
+	// trip entirely when the store is empty. If Count itself fails, fall
+	// through to the normal search path rather than blocking recall on it.
+	if count, err := svc.Count(ctx); err == nil && count == 0 {
+		return
 	}
 
 	results, err := svc.Search(ctx, memory.SearchRequest{Query: query, Limit: fetch})
@@ -192,7 +205,10 @@ func humanizeAge(m memory.Memory) string {
 	}
 }
 
-func formatRecallLine(m memory.Memory) string {
+// memoryLineSuffix builds the shared "(tags: ...; source: ...; age)" tail
+// used by both recall and list output; empty when the memory has none of
+// those attributes.
+func memoryLineSuffix(m memory.Memory) string {
 	var parts []string
 	if len(m.Tags) > 0 {
 		parts = append(parts, "tags: "+strings.Join(m.Tags, ","))
@@ -203,12 +219,18 @@ func formatRecallLine(m memory.Memory) string {
 	if age := humanizeAge(m); age != "" {
 		parts = append(parts, age)
 	}
-
-	suffix := ""
-	if len(parts) > 0 {
-		suffix = " (" + strings.Join(parts, "; ") + ")"
+	if len(parts) == 0 {
+		return ""
 	}
-	return fmt.Sprintf("- [%s] %s%s", m.Category, m.Content, suffix)
+	return " (" + strings.Join(parts, "; ") + ")"
+}
+
+func formatRecallLine(m memory.Memory) string {
+	return fmt.Sprintf("- [%s] %s%s", m.Category, m.Content, memoryLineSuffix(m))
+}
+
+func formatListLine(m memory.Memory) string {
+	return fmt.Sprintf("%s  [%s] %s%s", m.ID, m.Category, m.Content, memoryLineSuffix(m))
 }
 
 func runStore(args []string) {
@@ -257,6 +279,226 @@ func runStore(args []string) {
 	} else {
 		fmt.Printf("stored %s\n", outcome.Memory.ID)
 	}
+}
+
+func runList(args []string) {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	category := fs.String("category", "", "filter by category")
+	tags := fs.String("tags", "", "comma-separated tags filter (any match)")
+	limit := fs.Int("limit", 20, "max results (max 50)")
+	offset := fs.Int("offset", 0, "pagination offset")
+	fs.Parse(args)
+
+	if *limit <= 0 {
+		*limit = 20
+	}
+	if *limit > 50 {
+		*limit = 50
+	}
+	if *offset < 0 {
+		*offset = 0
+	}
+
+	var tagList []string
+	for _, t := range strings.Split(*tags, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			tagList = append(tagList, t)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+
+	svc, _, err := newService(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "engram list: %v\n", err)
+		os.Exit(1)
+	}
+
+	memories, err := svc.List(ctx, memory.ListRequest{
+		Category: *category,
+		Tags:     tagList,
+		Limit:    *limit,
+		Offset:   *offset,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "engram list: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, m := range memories {
+		fmt.Println(formatListLine(m))
+	}
+}
+
+// statsPage/hardCap bound the offset-loop used to page through every memory
+// for `engram stats`: page 50 at a time, stop after 1000 total so a runaway
+// store can't turn a stats call into an unbounded scan.
+const (
+	statsPage    = 50
+	statsHardCap = 1000
+)
+
+func runStats(args []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+
+	svc, _, err := newService(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "engram stats: %v\n", err)
+		os.Exit(1)
+	}
+
+	byCategory := map[string]int{}
+	bySource := map[string]int{}
+	var oldest, newest memory.Memory
+	haveAny := false
+	total := 0
+
+	for offset := 0; offset < statsHardCap; offset += statsPage {
+		memories, err := svc.List(ctx, memory.ListRequest{Limit: statsPage, Offset: offset})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "engram stats: %v\n", err)
+			os.Exit(1)
+		}
+		if len(memories) == 0 {
+			break
+		}
+
+		for _, m := range memories {
+			total++
+			byCategory[m.Category]++
+
+			source := m.Source
+			if source == "" {
+				source = "(none)"
+			}
+			bySource[source]++
+
+			if !haveAny || m.CreatedAt < oldest.CreatedAt {
+				oldest = m
+			}
+			if !haveAny || m.CreatedAt > newest.CreatedAt {
+				newest = m
+			}
+			haveAny = true
+		}
+
+		if len(memories) < statsPage {
+			break
+		}
+	}
+
+	fmt.Printf("total memories:  %d\n", total)
+	fmt.Println()
+
+	fmt.Println("by category:")
+	for _, c := range sortedKeys(byCategory) {
+		fmt.Printf("  %-12s %d\n", c, byCategory[c])
+	}
+	fmt.Println()
+
+	fmt.Println("by source:")
+	for _, s := range sortedKeys(bySource) {
+		fmt.Printf("  %-20s %d\n", s, bySource[s])
+	}
+	fmt.Println()
+
+	if haveAny {
+		fmt.Printf("oldest:  %s  [%s] %s\n", oldest.CreatedAt, oldest.Category, truncate(oldest.Content, 60))
+		fmt.Printf("newest:  %s  [%s] %s\n", newest.CreatedAt, newest.Category, truncate(newest.Content, 60))
+	}
+
+	printRecallLogStats()
+}
+
+// printRecallLogStats parses the recall hook's audit log (if present) into
+// a fire-rate summary: how often engram-recall.sh actually injected memories
+// into a prompt, overall and over the last 7 days. Absence of the log file
+// (hook never installed/run) is not an error -- it just means no section.
+func printRecallLogStats() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	if home == "" {
+		return
+	}
+
+	logPath := home + "/.claude/logs/engram-recall.log"
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return
+	}
+
+	var total, withHits, total7, withHits7 int
+	cutoff := time.Now().UTC().AddDate(0, 0, -7)
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		total++
+
+		recent := false
+		if ts, err := time.Parse(time.RFC3339, fields[0]); err == nil && !ts.Before(cutoff) {
+			recent = true
+		}
+		if recent {
+			total7++
+		}
+
+		hits := 0
+		for _, f := range fields[1:] {
+			if v, ok := strings.CutPrefix(f, "hits="); ok {
+				fmt.Sscanf(v, "%d", &hits)
+				break
+			}
+		}
+		if hits >= 1 {
+			withHits++
+			if recent {
+				withHits7++
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("recall log (~/.claude/logs/engram-recall.log):")
+	fmt.Printf("  total prompts:            %d\n", total)
+	fmt.Printf("  prompts with hits:        %d\n", withHits)
+	fmt.Printf("  fire rate (overall):      %s\n", percentOrNA(withHits, total))
+	fmt.Printf("  prompts (last 7 days):    %d\n", total7)
+	fmt.Printf("  fire rate (last 7 days):  %s\n", percentOrNA(withHits7, total7))
+}
+
+func percentOrNA(n, total int) string {
+	if total == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", 100*float64(n)/float64(total))
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func runDelete(args []string) {

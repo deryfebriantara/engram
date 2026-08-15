@@ -31,6 +31,17 @@ PROMPT="$(printf '%s' "$INPUT_JSON" | jq -r '.prompt // empty' 2>/dev/null)"
 CWD="$(printf '%s' "$INPUT_JSON" | jq -r '.cwd // empty' 2>/dev/null)"
 
 [ -n "$PROMPT" ] || exit 0
+
+# Claude Code sometimes prepends IDE/system noise blocks to the prompt (e.g.
+# `<ide_opened_file>The user opened...</ide_opened_file>`), and previously we
+# embedded that verbatim -- garbage in, garbage out for recall. Strip known
+# noise tags (and their content) first, then any remaining short tags, then
+# collapse whitespace, before applying the length/slash-command guards below.
+PROMPT="$(printf '%s' "$PROMPT" | perl -0pe 's/<(ide_opened_file|ide_selection|ide_diagnostics|system-reminder|command-name|command-message|command-args)>.*?<\/\1>//gs')"
+PROMPT="$(printf '%s' "$PROMPT" | perl -pe 's/<[^>]{1,80}>//g')"
+PROMPT="$(printf '%s' "$PROMPT" | tr -s '[:space:]' ' ')"
+PROMPT="$(printf '%s' "$PROMPT" | sed -e 's/^ *//' -e 's/ *$//')"
+
 [ "${#PROMPT}" -ge 20 ] || exit 0
 
 case "$PROMPT" in
@@ -41,7 +52,7 @@ SOURCE="$(basename "${CWD:-.}" 2>/dev/null)"
 
 OUTPUT="$(timeout 10 "$ENGRAM_BIN" recall \
   -limit "${ENGRAM_RECALL_LIMIT:-3}" \
-  -threshold "${ENGRAM_RECALL_THRESHOLD:-0.48}" \
+  -threshold "${ENGRAM_RECALL_THRESHOLD:-0.42}" \
   -source "$SOURCE" \
   -- "$PROMPT" 2>/dev/null)"
 RC=$?

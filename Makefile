@@ -39,12 +39,19 @@ install-hooks:
 	mkdir -p $(HOOKS_DIR)
 	cp hooks/engram-recall.sh $(HOOKS_DIR)/engram-recall.sh
 	cp hooks/engram-capture.sh $(HOOKS_DIR)/engram-capture.sh
-	chmod +x $(HOOKS_DIR)/engram-recall.sh $(HOOKS_DIR)/engram-capture.sh
+	cp hooks/engram-capture-cron.sh $(HOOKS_DIR)/engram-capture-cron.sh
+	cp hooks/engram-backup.sh $(HOOKS_DIR)/engram-backup.sh
+	chmod +x $(HOOKS_DIR)/engram-recall.sh $(HOOKS_DIR)/engram-capture.sh $(HOOKS_DIR)/engram-capture-cron.sh $(HOOKS_DIR)/engram-backup.sh
 	@echo "Installed hooks to $(HOOKS_DIR)/"
 	@echo ""
-	@echo "These are not registered yet. Add to ~/.claude/settings.json:"
+	@echo "engram-recall.sh and engram-capture.sh are not registered yet. Add to ~/.claude/settings.json:"
 	@echo '  UserPromptSubmit -> ~/.claude/hooks/engram-recall.sh'
 	@echo '  SessionEnd       -> ~/.claude/hooks/engram-capture.sh'
+	@echo ""
+	@echo "engram-capture-cron.sh and engram-backup.sh run from cron, not Claude Code hooks."
+	@echo "Suggested crontab lines (crontab -e):"
+	@echo '  17 */6 * * * $(HOME)/.claude/hooks/engram-capture-cron.sh'
+	@echo '  43 3 * * 0 $(HOME)/.claude/hooks/engram-backup.sh'
 
 clean:
 	rm -f $(BINARY) $(CLI_BINARY)

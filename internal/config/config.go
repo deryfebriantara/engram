@@ -19,7 +19,7 @@ func Load() *Config {
 		OllamaURL:      getEnv("OLLAMA_URL", "http://127.0.0.1:11434"),
 		OllamaModel:    getEnv("OLLAMA_MODEL", "nomic-embed-text"),
 		CollectionName: getEnv("COLLECTION_NAME", "claude_memories"),
-		DedupThreshold: getEnvFloat("DEDUP_THRESHOLD", 0.2),
+		DedupThreshold: getEnvFloat("DEDUP_THRESHOLD", 0.15),
 	}
 }
 

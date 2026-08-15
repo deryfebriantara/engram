@@ -18,6 +18,28 @@ log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >>"$LOG_FILE" 2>/dev/null
 }
 
+# Best-effort secret masking before CONVO leaves the box for the external
+# Qwen gateway. Mirrors the credential patterns in
+# ~/.claude/scripts/secret-scan.sh where applicable (AWS keys, GitHub/OpenAI/
+# service tokens, PEM blocks), plus a couple of transcript-specific ones
+# (generic "key: value" pairs, bare long hex strings). Whole matches are
+# replaced with [REDACTED]. Over-redaction of ordinary code (e.g. a 40+ char
+# hex string that's just a git SHA, not a secret) is an accepted tradeoff:
+# this text leaves the machine, so erring toward masking too much beats
+# leaking a real credential. `\x27` is a single-quote written as a hex
+# escape so this whole script can stay single-quoted in the pipeline below.
+redact_secrets() {
+  perl -pe '
+    s/AKIA[0-9A-Z]{16}/[REDACTED]/g;
+    s/gh[pousr]_[A-Za-z0-9]{30,}/[REDACTED]/g;
+    s/sk-[A-Za-z0-9_-]{20,}/[REDACTED]/g;
+    s/svc-[a-f0-9]{32,}/[REDACTED]/g;
+    s/Bearer\s+[A-Za-z0-9._=+\/-]{20,}/[REDACTED]/g;
+    s/(api[_-]?key|apikey|token|password|passwd|secret)\s*[=:]\s*[^\s"\x27]{8,}/[REDACTED]/gi;
+    s/\b[A-Fa-f0-9]{40,}\b/[REDACTED]/g;
+  ' | perl -0pe 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/[REDACTED]/gs'
+}
+
 # This hook must never fail or hang the SessionEnd flow. Whatever happens
 # internally, we always exit 0.
 trap 'exit 0' EXIT
@@ -103,6 +125,8 @@ if [ -z "$CONVO" ]; then
   log "skip: no extractable text in transcript"
   exit 0
 fi
+
+CONVO="$(printf '%s' "$CONVO" | redact_secrets)"
 
 SYSTEM_PROMPT='You are a memory-extraction function for a coding assistant. Read the transcript and extract at most 5 LASTING memories: durable user preferences, project decisions, recurring patterns, or hard-won facts. Do NOT extract task minutiae, anything session-specific, or secrets/credentials.
 
