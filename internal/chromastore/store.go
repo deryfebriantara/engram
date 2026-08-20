@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	chroma "github.com/amikos-tech/chroma-go/pkg/api/v2"
+	"github.com/amikos-tech/chroma-go/pkg/embeddings"
 
 	"github.com/deryfebriantara/my-claude-memory/internal/embedder"
 	"github.com/deryfebriantara/my-claude-memory/internal/memory"
@@ -27,6 +28,7 @@ func New(ctx context.Context, chromaURL, collectionName string, emb *embedder.Ol
 
 	col, err := client.GetOrCreateCollection(ctx, collectionName,
 		chroma.WithEmbeddingFunctionCreate(emb.EF),
+		chroma.WithHNSWSpaceCreate(embeddings.COSINE),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get or create collection: %w", err)
@@ -202,14 +204,23 @@ func (s *ChromaStore) Healthy(ctx context.Context) error {
 	return nil
 }
 
+// Tags are stored twice: as one joined "tags" string for reading back, and as
+// one boolean "tag:<name>" attribute per tag, because Chroma metadata has no
+// list type and equality filters can't match inside a joined string.
 func buildMetadata(mem memory.Memory) chroma.DocumentMetadata {
-	return chroma.NewDocumentMetadata(
+	attrs := []*chroma.MetaAttribute{
 		chroma.NewStringAttribute("category", mem.Category),
 		chroma.NewStringAttribute("tags", strings.Join(mem.Tags, ",")),
 		chroma.NewStringAttribute("source", mem.Source),
 		chroma.NewStringAttribute("created_at", mem.CreatedAt),
 		chroma.NewStringAttribute("updated_at", mem.UpdatedAt),
-	)
+	}
+	for _, tag := range mem.Tags {
+		if tag != "" {
+			attrs = append(attrs, chroma.NewBoolAttribute("tag:"+tag, true))
+		}
+	}
+	return chroma.NewDocumentMetadata(attrs...)
 }
 
 func buildWhereFilter(category string, tags []string) chroma.WhereClause {
@@ -222,7 +233,7 @@ func buildWhereFilter(category string, tags []string) chroma.WhereClause {
 	if len(tags) > 0 {
 		var tagClauses []chroma.WhereClause
 		for _, tag := range tags {
-			tagClauses = append(tagClauses, chroma.EqString("tags", tag))
+			tagClauses = append(tagClauses, chroma.EqBool("tag:"+tag, true))
 		}
 		if len(tagClauses) == 1 {
 			clauses = append(clauses, tagClauses[0])
