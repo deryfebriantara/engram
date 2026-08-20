@@ -1,4 +1,5 @@
 /claude-memory-server
+/engram
 *.exe
 *.test
 *.out

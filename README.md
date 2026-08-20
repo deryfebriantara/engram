@@ -197,6 +197,78 @@ You should see ChromaDB and Ollama both reporting `ok`.
 
 ---
 
+## Automatic memory (Claude Code hooks)
+
+Beyond the MCP tools (which Claude calls deliberately), Engram ships Claude Code hooks that make memory recall and capture *automatic*, via the `engram` CLI (`cmd/engram`) — a stdio-driven front-end to the same memory service, built for scripting rather than conversation.
+
+| Hook | Trigger | What it does |
+|------|---------|--------------|
+| `hooks/engram-recall.sh` | `UserPromptSubmit` | Searches memory for the incoming prompt and, if relevant memories clear the distance threshold, injects them as context before Claude sees the prompt. Strips IDE/system noise blocks (`<ide_opened_file>`, `<system-reminder>`, etc.) out of the prompt first — those used to get embedded verbatim, which is not what you want to search on. Skips silently on short prompts (<20 chars after cleaning), slash commands, or any internal error. |
+| `hooks/engram-capture.sh` | `SessionEnd` | Sends the session transcript to the self-hosted Qwen gateway, asks it to extract 0–5 durable memories (preferences, decisions, patterns, facts — never task minutiae or secrets), and stores whatever qualifies. Redacts likely secrets from the transcript text before it ever leaves the box (see below). Logs every decision to `~/.claude/logs/engram-capture.log`; produces no stdout. |
+| `hooks/engram-capture-cron.sh` | cron, e.g. every 6h | Incremental backstop for the hook above — see [Why not just SessionEnd?](#why-not-just-sessionend) |
+| `hooks/engram-backup.sh` | cron, e.g. weekly | Tars up the ChromaDB data volume to `~/backups/engram/`, keeping the newest 8 |
+
+All four scripts are defensive by design: they depend only on `jq`/`curl`/`perl`/coreutils, bound every network call with `timeout`, and always exit `0` so a broken hook (or cron job) can never block Claude Code or pile up failure emails.
+
+Install them with:
+
+```bash
+make install-hooks
+```
+
+This copies the scripts to `~/.claude/hooks/` and prints the suggested crontab lines for the two cron scripts — it does **not** register or schedule anything itself. Wire up the Claude Code hooks yourself in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/engram-recall.sh" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "~/.claude/hooks/engram-capture.sh" }] }]
+  }
+}
+```
+
+...and add the cron scripts yourself via `crontab -e`:
+
+```cron
+17 */6 * * * $HOME/.claude/hooks/engram-capture-cron.sh
+43 3 * * 0   $HOME/.claude/hooks/engram-backup.sh
+```
+
+### Why not just SessionEnd?
+
+`engram-capture.sh` only runs when Claude Code fires `SessionEnd` — and in practice, plenty of sessions never end cleanly (killed terminal, closed laptop lid, OOM, a crashed `tmux` pane). Observed on this VPS: 32 `SessionEnd` skips logged, 0 real captures, because none of those sessions triggered the hook at all. `engram-capture-cron.sh` decouples capture from session lifecycle: on a cron schedule, it scans transcripts modified in the last 7 days under `~/.claude/projects` (overridable via `ENGRAM_PROJECTS_DIR`, e.g. for tests), tracks how many lines of each it has already processed in `~/.local/state/engram/capture-offsets.tsv`, and feeds only the *new* tail of each transcript into `engram-capture.sh` once it has accumulated at least 8 new user/assistant lines (below that, it waits rather than firing on scraps — and does **not** advance its offset, so those lines aren't silently dropped, just deferred to the next run). It excludes subagent transcripts, caps itself at 5 transcripts per run, and uses `flock` so overlapping cron runs can't stack up.
+
+### Redaction
+
+`engram-capture.sh` sends transcript text to an external gateway (the self-hosted Qwen instance), so before that request is built, the extracted conversation text is run through a best-effort secret-masking pass (`redact_secrets` in the script): AWS access keys, GitHub/OpenAI/Anthropic/service tokens, `Bearer` tokens, generic `key: value` / `password=...`-shaped assignments, PEM private-key blocks, and bare 40+ char hex strings are all replaced with `[REDACTED]`. The patterns mirror `~/.claude/scripts/secret-scan.sh`'s credential set where applicable. This deliberately over-redacts sometimes (e.g. a long hex commit SHA isn't actually a secret) — for text leaving the machine, masking too much is the safer failure mode.
+
+### Backup
+
+`engram-backup.sh` tars up the ChromaDB Docker volume (`engram_chroma_data`) to `~/backups/engram/chroma-<timestamp>.tar.gz` and prunes to the newest 8. It's a **live-file** copy — no write-freeze or snapshot around the `tar` — so there's a small torn-copy risk if it runs mid-write; acceptable here since engram is a low-write store (memories are stored one at a time, not in bulk) and, even in the unlucky case, the previous backups are still around. Skips gracefully (logs and exits 0) if `docker` or the volume isn't present.
+
+### `engram` CLI
+
+| Command | Description |
+|---------|-------------|
+| `engram recall [-limit N] [-threshold F] [-source S] <query...>` | Semantic search, re-ranked by recency and source match; prints one `- [category] content (tags: ...; source: ...; age)` line per hit, nothing if none clear the threshold. Skips the embed+search round trip entirely (and prints nothing) when the store is empty |
+| `engram store [-category C] [-tags a,b] [-source S] <content...>` | Stores a memory (dedup applies); prints `stored <id>` or `merged into <id>` |
+| `engram delete <id>` | Deletes a memory; prints `deleted <id>` |
+| `engram list [-category C] [-tags a,b] [-limit N] [-offset N]` | Lists memories, one `<id>  [category] content (tags: ...; source: ...; age)` line per row; default limit 20, max 50; nothing printed when there are no matches |
+| `engram stats` | Prints total/per-category/per-source memory counts and oldest/newest timestamps (paging through the store internally, capped at 1000), plus — if `~/.claude/logs/engram-recall.log` exists — the recall hook's real-world fire rate (overall and last 7 days) |
+| `engram health` | Reports ChromaDB/Ollama status and memory count; exits non-zero if either is unhealthy |
+
+stdout is kept machine-clean on every subcommand — diagnostics always go to stderr — because `engram recall`'s output is injected straight into an LLM's context by the recall hook.
+
+### Env knobs
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGRAM_RECALL_LIMIT` | `3` | Max memories the recall hook injects per prompt |
+| `ENGRAM_RECALL_THRESHOLD` | `0.42` | Max raw cosine distance the recall hook will consider. Re-benchmarked after switching to nomic-embed-text's `search_document:`/`search_query:` prefixes (see [Design Decisions](#design-decisions)) — prefixing shifts every distance, so the old 0.48 default no longer means the same thing. Measured related-query distances span 0.28–0.41 (held-out paraphrases sit at the top of that band), while unrelated prompts bottom out anywhere from ~0.36 (diverse store) to ~0.45 (small store) — the bands overlap, so no scalar threshold is clean. `0.42` deliberately favors recall: a missed memory silently forfeits the system's whole value, while a false positive costs ~3 clearly-labeled lines the model can ignore. Set `0.35` for precision mode (fewest false positives, but misses paraphrased prompts) |
+| `DEDUP_THRESHOLD` | `0.15` | Max cosine distance for `Service.Store` to treat a new memory as a duplicate and merge instead of insert (see [Design Decisions](#design-decisions)); `0` disables dedup. Re-measured post-prefix-change against 4 EN/ID paraphrase pairs (distances 0.02-0.24, all must merge) and 3 related-but-distinct pairs (distances 0.19, 0.39, 0.41, must not merge) — `0.15` is deliberately conservative: a false merge silently *overwrites* a distinct memory (one measured distinct pair sits at 0.19, inside the paraphrase band), while a missed merge just leaves a harmless duplicate that offline consolidation can clean up later. The asymmetry favors under-merging, so the default stays below the closest measured distinct pair with margin; paraphrase pairs at 0.02–0.11 still merge, looser ones (0.20–0.24) intentionally do not |
+
+---
+
 ## Configuration
 
 All settings are configurable via environment variables:
@@ -207,6 +279,7 @@ All settings are configurable via environment variables:
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama API URL |
 | `OLLAMA_MODEL` | `nomic-embed-text` | Embedding model (768 dimensions) |
 | `COLLECTION_NAME` | `claude_memories` | ChromaDB collection name |
+| `DEDUP_THRESHOLD` | `0.15` | Cosine-distance threshold for merging near-duplicate memories on store; `0` disables |
 
 To use custom values, set them before running, or configure in your Claude Code MCP settings:
 
@@ -220,15 +293,20 @@ claude mcp add claude-memory -- env CHROMA_URL=http://my-chroma:8000 ~/.local/bi
 
 ```
 engram/
-├── cmd/claude-memory-server/
-│   └── main.go                    # Entry point — wires deps, starts stdio server
+├── cmd/
+│   ├── claude-memory-server/
+│   │   └── main.go                # Entry point — wires deps, starts stdio MCP server
+│   └── engram/
+│       ├── main.go                # CLI entry point — recall/store/delete/list/stats/health subcommands
+│       └── main_test.go           # agePenalty/humanizeAge/formatRecallLine unit tests
 ├── internal/
 │   ├── config/config.go           # Environment variable loading
-│   ├── embedder/ollama.go         # Ollama embedding function wrapper
+│   ├── embedder/ollama.go         # Ollama embedding function wrapper (adds nomic-embed-text's asymmetric prefixes)
 │   ├── chromastore/store.go       # ChromaDB operations (implements Store interface)
 │   ├── memory/
 │   │   ├── types.go               # Memory struct, Store interface, request/response types
-│   │   └── service.go             # Business logic, validation, orchestration
+│   │   ├── service.go             # Business logic, validation, dedup/supersede, orchestration
+│   │   └── service_test.go        # Service unit tests against a mockStore
 │   └── tools/
 │       ├── register.go            # Bulk tool registration
 │       ├── memory_store.go        # memory_store handler
@@ -237,8 +315,13 @@ engram/
 │       ├── memory_delete.go       # memory_delete handler
 │       ├── memory_update.go       # memory_update handler
 │       └── health_check.go        # health_check handler
+├── hooks/
+│   ├── engram-recall.sh           # UserPromptSubmit hook — auto-injects relevant memories
+│   ├── engram-capture.sh          # SessionEnd hook — extracts + stores memories via Qwen gateway
+│   ├── engram-capture-cron.sh     # cron backstop — incremental capture independent of SessionEnd
+│   └── engram-backup.sh           # cron job — tars up the ChromaDB volume, prunes to newest 8
 ├── docker-compose.yml             # ChromaDB container
-├── Makefile                       # Build, install, test, infra targets
+├── Makefile                       # Build, install, test, infra, hooks targets
 ├── go.mod
 └── go.sum
 ```
@@ -249,13 +332,14 @@ engram/
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Compile the binary |
-| `make install` | Build + copy to `~/.local/bin` |
+| `make build` | Compile both `claude-memory-server` and `engram` |
+| `make install` | Build + copy both binaries to `~/.local/bin` |
+| `make install-hooks` | Copy `hooks/*.sh` to `~/.claude/hooks/` and print suggested crontab lines (does not register the Claude Code hooks or touch crontab itself) |
 | `make test` | Run all tests |
 | `make infra` | Start ChromaDB via Docker Compose |
 | `make infra-down` | Stop ChromaDB |
 | `make register` | Show Claude Code registration command |
-| `make clean` | Remove built binary |
+| `make clean` | Remove built binaries |
 
 ---
 
@@ -278,6 +362,8 @@ engram/
 - **Auto-embedding** — chroma-go's built-in Ollama integration means the server passes text, not vectors. Embedding happens transparently on add and query.
 - **Single collection** — All memories live in `claude_memories` with category as a metadata filter, keeping the data model simple.
 - **Interface-driven store** — The `memory.Store` interface decouples business logic from ChromaDB, enabling future database swaps or mock-based testing.
+- **Dedup/supersede on store** — `Service.Store` runs a best-effort nearest-neighbor search before inserting; if the closest existing memory is within `DEDUP_THRESHOLD` cosine distance, it's updated in place (content replaced, tags unioned, source kept unless overridden) instead of creating a near-duplicate. This makes repeated auto-capture of the same fact idempotent rather than noisy. A failed dedup lookup never blocks the store — it just falls back to a normal insert. Note that the lookup is global (no category/tag filter), so in rare cases a closely-related-but-distinct memory can still land inside the dedup band — see the [`DEDUP_THRESHOLD` knob](#env-knobs) for a concrete example found during benchmarking.
+- **nomic-embed-text task prefixes** — nomic-embed-text is an *asymmetric* embedding model: it's trained expecting a `search_document: ` prefix on things you store and a `search_query: ` prefix on things you search with, and mixing them up measurably hurts retrieval quality. chroma-go's built-in Ollama embedding function sends raw text with neither prefix, so `internal/embedder/ollama.go` wraps it in a small `prefixedEF` (implements `embeddings.EmbeddingFunction`, embeds the real one, overrides only `EmbedDocuments`/`EmbedQuery`) that adds the right prefix at the right call site. This changes every cosine distance the store produces, which is why `ENGRAM_RECALL_THRESHOLD` and `DEDUP_THRESHOLD` both needed re-benchmarking after this change (see [Env knobs](#env-knobs)) — the old 0.48/0.2 defaults were calibrated against unprefixed embeddings and no longer mean the same thing.
 - **Errors via MCP** — Tool handlers return `mcp.NewToolResultError()`, never Go-level errors, so Claude always gets a readable message.
 - **Stderr-only logging** — stdout is reserved exclusively for MCP JSON-RPC; all logs go to stderr.
 

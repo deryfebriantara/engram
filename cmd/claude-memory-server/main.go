@@ -31,7 +31,7 @@ func main() {
 		logger.Fatalf("Failed to create store: %v", err)
 	}
 
-	svc := memory.NewService(store)
+	svc := memory.NewService(store, cfg.DedupThreshold)
 
 	s := server.NewMCPServer(
 		"claude-memory",

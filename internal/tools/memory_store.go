@@ -39,7 +39,7 @@ func NewMemoryStoreHandler(svc *memory.Service) func(ctx context.Context, req mc
 		source := req.GetString("source", "")
 		tags := req.GetStringSlice("tags", nil)
 
-		mem, err := svc.Store(ctx, memory.StoreRequest{
+		outcome, err := svc.Store(ctx, memory.StoreRequest{
 			Content:  content,
 			Category: category,
 			Tags:     tags,
@@ -49,7 +49,10 @@ func NewMemoryStoreHandler(svc *memory.Service) func(ctx context.Context, req mc
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to store memory: %s", err)), nil
 		}
 
-		data, _ := json.MarshalIndent(mem, "", "  ")
+		data, _ := json.MarshalIndent(outcome.Memory, "", "  ")
+		if outcome.SupersededID != "" {
+			return mcp.NewToolResultText(fmt.Sprintf("Merged with existing similar memory (superseded %s):\n%s", outcome.SupersededID, string(data))), nil
+		}
 		return mcp.NewToolResultText(fmt.Sprintf("Memory stored successfully:\n%s", string(data))), nil
 	}
 }
